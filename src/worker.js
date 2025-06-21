@@ -2,6 +2,7 @@
 // Main Cloudflare Worker entry point - handles HTTP routing and orchestrates verification
 
 import { SheetsService } from './services/sheets-service.js';
+import { HtmlParserService } from './services/html-parser.js';
 import { HtmlTemplates } from './templates/html-templates.js';
 
 export default {
@@ -72,6 +73,10 @@ async function handleVerification(request, env) {
 
     // Initialize services
     const sheetsService = SheetsService.fromEnv(env);
+    const htmlParser = new HtmlParserService({
+      timeout: 15000, // 15 second timeout per URL
+      maxRetries: 2
+    });
 
     // Validate sheet access first
     console.log('Validating sheet access...');
@@ -103,8 +108,9 @@ async function handleVerification(request, env) {
       console.warn(`Found ${invalidUrls.length} invalid URLs that will be skipped`);
     }
 
-    // Process each URL (this is where we'll add HTML parsing and LLM verification)
-    const verificationResults = await processUrlsForVerification(validUrls, sourceData, env);
+    // Process each URL with HTML parsing
+    console.log(`Starting HTML parsing for ${validUrls.length} URLs...`);
+    const verificationResults = await processUrlsForVerification(validUrls, sourceData, htmlParser);
 
     // Write results back to verifier sheet
     console.log('Writing results back to verifier sheet...');
@@ -132,37 +138,59 @@ async function handleVerification(request, env) {
 }
 
 /**
- * Processes URLs for verification (placeholder for HTML parsing + LLM verification)
+ * Processes URLs for verification with actual HTML parsing
  * @param {Array} validUrls - Array of valid URL objects
  * @param {Array} sourceData - Source sheet data to compare against
- * @param {Object} env - Environment variables
+ * @param {HtmlParserService} htmlParser - HTML parser service instance
  * @returns {Promise<Array>} Array of verification results
  */
-async function processUrlsForVerification(validUrls, sourceData, env) {
+async function processUrlsForVerification(validUrls, sourceData, htmlParser) {
   const results = [];
 
-  // For now, we'll create placeholder results
-  // TODO: Add HTML parsing and LLM verification in next phase
-  for (const urlData of validUrls) {
+  // Extract just the URLs for parsing
+  const urlsToProcess = validUrls.map(urlData => urlData.url);
+
+  // Parse all URLs with concurrency control
+  console.log('Parsing HTML from URLs...');
+  const parsedResults = await htmlParser.parseUrls(urlsToProcess, 3); // 3 concurrent requests
+
+  // Process each parsed result
+  for (let i = 0; i < validUrls.length; i++) {
+    const urlData = validUrls[i];
+    const parsedData = parsedResults.find(result => result.url === urlData.url);
+
     try {
-      // Placeholder verification logic
-      const result = {
+      if (!parsedData || !parsedData.success) {
+        // HTML parsing failed
+        results.push({
+          rowIndex: urlData.rowIndex,
+          url: urlData.url,
+          status: 'failed',
+          verification: 'HTML parsing failed',
+          h1: null,
+          metaTitle: null,
+          metaDescription: null,
+          timestamp: new Date().toISOString(),
+          notes: parsedData ? parsedData.error : 'Unknown parsing error'
+        });
+        continue;
+      }
+
+      // HTML parsing succeeded - now do basic verification
+      const verification = performBasicVerification(parsedData, sourceData);
+
+      results.push({
         rowIndex: urlData.rowIndex,
         url: urlData.url,
-        status: 'processing', // Will be 'verified', 'failed', or 'processing'
-        verification: 'Placeholder - HTML parsing and LLM verification not yet implemented',
-        h1: 'TODO: Extract H1',
-        metaTitle: 'TODO: Extract meta title',
-        metaDescription: 'TODO: Extract meta description',
+        status: verification.status,
+        verification: verification.summary,
+        h1: parsedData.h1 || 'No H1 found',
+        metaTitle: parsedData.metaTitle || 'No title found',
+        metaDescription: parsedData.metaDescription || 'No description found',
         timestamp: new Date().toISOString(),
-        notes: 'Initial implementation - verification logic pending'
-      };
+        notes: verification.details
+      });
 
-      results.push(result);
-      
-      // Add small delay to avoid overwhelming external sites
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
     } catch (error) {
       console.error(`Error processing URL ${urlData.url}:`, error);
       
@@ -170,7 +198,7 @@ async function processUrlsForVerification(validUrls, sourceData, env) {
         rowIndex: urlData.rowIndex,
         url: urlData.url,
         status: 'failed',
-        verification: 'Error',
+        verification: 'Processing error',
         timestamp: new Date().toISOString(),
         notes: `Error: ${error.message}`
       });
@@ -181,6 +209,66 @@ async function processUrlsForVerification(validUrls, sourceData, env) {
 }
 
 /**
+ * Performs basic verification by comparing parsed content with source data
+ * (This is a placeholder for LLM-based verification)
+ * @param {Object} parsedData - Parsed HTML data
+ * @param {Array} sourceData - Source sheet offers data
+ * @returns {Object} Verification result
+ */
+function performBasicVerification(parsedData, sourceData) {
+  const { h1, metaTitle, metaDescription } = parsedData;
+  const contentText = `${h1 || ''} ${metaTitle || ''} ${metaDescription || ''}`.toLowerCase();
+
+  // Basic keyword matching (placeholder for LLM verification)
+  const foundBrands = [];
+  const foundOffers = [];
+
+  for (const offer of sourceData) {
+    // Check for brand mentions
+    if (offer.brand && contentText.includes(offer.brand.toLowerCase())) {
+      foundBrands.push(offer.brand);
+    }
+
+    // Check for offer keywords
+    if (offer.offer) {
+      const offerKeywords = offer.offer.toLowerCase().split(' ').filter(word => word.length > 3);
+      for (const keyword of offerKeywords) {
+        if (contentText.includes(keyword)) {
+          foundOffers.push(keyword);
+        }
+      }
+    }
+  }
+
+  // Determine verification status
+  let status = 'verified';
+  let summary = 'Content verified';
+  let details = '';
+
+  if (foundBrands.length === 0 && foundOffers.length === 0) {
+    status = 'failed';
+    summary = 'No matching content found';
+    details = 'No brands or offers from source sheet found in page content';
+  } else {
+    const brandText = foundBrands.length > 0 ? `Brands: ${foundBrands.join(', ')}` : '';
+    const offerText = foundOffers.length > 0 ? `Keywords: ${foundOffers.slice(0, 3).join(', ')}` : '';
+    details = [brandText, offerText].filter(Boolean).join(' | ');
+    
+    if (foundBrands.length === 0) {
+      summary = 'Partial match - no brand mentions';
+    } else if (foundOffers.length === 0) {
+      summary = 'Partial match - brand found but no offer details';
+    }
+  }
+
+  return {
+    status,
+    summary,
+    details
+  };
+}
+
+/**
  * Health check endpoint
  * @returns {Response} Health status
  */
@@ -188,7 +276,8 @@ function handleHealthCheck() {
   return new Response(JSON.stringify({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    version: '2.0.0',
+    features: ['html-parsing', 'basic-verification']
   }), {
     headers: { 'Content-Type': 'application/json' }
   });
