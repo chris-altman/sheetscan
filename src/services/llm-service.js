@@ -89,28 +89,44 @@ export class LlmService {
   }
 
   /**
-   * Builds the prompt for offer verification
-   * @param {Object} htmlData - Parsed HTML data
-   * @param {Array} sourceOffers - Source sheet offers
-   * @param {string} url - URL being verified
-   * @returns {string} Formatted prompt
-   */
-  buildVerificationPrompt(htmlData, sourceOffers, url) {
-    const { h1, metaTitle, metaDescription } = htmlData;
-    
-    // Format source offers for context
-    const formattedOffers = sourceOffers.map(offer => 
-      `Brand: ${offer.brand || 'N/A'}\nOffer: ${offer.offer || 'N/A'}\nStates: ${offer.states || 'N/A'}\nKey T&C: ${offer.keyTandC || 'N/A'}`
-    ).join('\n\n---\n\n');
+ * Builds the prompt for offer verification (UPDATED VERSION)
+ * @param {Object} htmlData - Parsed HTML data
+ * @param {Array} sourceOffers - Source sheet offers
+ * @param {string} url - URL being verified
+ * @returns {string} Formatted prompt
+ */
+buildVerificationPrompt(htmlData, sourceOffers, url) {
+  const { h1, metaTitle, metaDescription, mainContent } = htmlData;
+  
+  // Format source offers for context
+  const formattedOffers = sourceOffers.map(offer => 
+    `Brand: ${offer.brand || 'N/A'}\nOffer: ${offer.offer || 'N/A'}\nStates: ${offer.states || 'N/A'}\nKey T&C: ${offer.keyTandC || 'N/A'}`
+  ).join('\n\n---\n\n');
 
-    return `You are verifying the accuracy of offer information on a webpage against source data.
+  // Prepare webpage content - prioritize mainContent if available
+  let webpageContent;
+  if (mainContent && mainContent.trim().length > 50) {
+    // Use the full extracted content
+    webpageContent = `MAIN CONTENT: ${mainContent}
+
+META DATA:
+H1: ${h1 || 'Not found'}
+Title: ${metaTitle || 'Not found'}
+Meta Description: ${metaDescription || 'Not found'}`;
+  } else {
+    // Fallback to meta data only if mainContent extraction failed
+    webpageContent = `H1: ${h1 || 'Not found'}
+Title: ${metaTitle || 'Not found'}
+Meta Description: ${metaDescription || 'Not found'}
+Note: Full page content extraction failed, using meta data only.`;
+  }
+
+  return `You are verifying the accuracy of offer information on a webpage against source data.
 
 URL: ${url}
 
 WEBPAGE CONTENT:
-H1: ${h1 || 'Not found'}
-Title: ${metaTitle || 'Not found'}
-Meta Description: ${metaDescription || 'Not found'}
+${webpageContent}
 
 SOURCE OFFERS TO VERIFY AGAINST:
 ${formattedOffers}
@@ -121,6 +137,8 @@ Compare the webpage content against the source offers and determine:
 1. BRAND MATCH: Does the webpage mention any of the brands from the source data?
 2. OFFER MATCH: Does the webpage describe offers that match the source data?
 3. TERMS MATCH: Are key terms and conditions accurately represented?
+
+Focus on the MAIN CONTENT section which contains the actual visible text users see on the page.
 
 Respond in this exact JSON format:
 {
@@ -137,7 +155,7 @@ Respond in this exact JSON format:
 }
 
 Be strict in your verification. Only mark as "verified" if the content clearly and accurately represents the source offers.`;
-  }
+}
 
   /**
    * Calls the appropriate LLM API based on provider
