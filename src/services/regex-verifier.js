@@ -11,7 +11,7 @@ export class RegexVerifier {
   }
 
   /**
-   * Main verification method - replaces LLM calls entirely
+   * FIXED: Main verification method with smart selective matching
    * @param {Object} htmlData - Parsed HTML data
    * @param {Array} sourceOffers - Source sheet offers  
    * @param {string} url - URL being verified
@@ -23,19 +23,46 @@ export class RegexVerifier {
     // Extract all text content
     const allText = this.extractAllText(htmlData);
     
-    // Find matches
-    const detectedBrands = this.detectBrands(allText);
-    const detectedOffers = this.detectOffers(allText);
-    const detectedAmounts = this.detectAmounts(allText);
-    const detectedStates = this.detectStates(allText);
+    // STEP 1: Detect what's actually on the page
+    const detectedContent = {
+      brands: this.detectBrands(allText),
+      offers: this.detectOffers(allText),
+      amounts: this.detectAmounts(allText),
+      states: this.detectStates(allText),
+      domain: this.extractDomain(url),
+      fullText: allText
+    };
     
-    // Match against source data
-    const sourceAnalysis = this.analyzeSourceOffers(sourceOffers);
-    const verification = this.performVerification(
-      { detectedBrands, detectedOffers, detectedAmounts, detectedStates },
-      sourceAnalysis,
-      allText
-    );
+    // STEP 2: Find only the relevant source offers (KEY FIX!)
+    const relevantOffers = this.findRelevantOffers(detectedContent, sourceOffers);
+    
+    console.log(`URL: ${url}`);
+    console.log(`Total source offers: ${sourceOffers.length}`);
+    console.log(`Relevant offers found: ${relevantOffers.length}`);
+    console.log(`Relevant brands: ${relevantOffers.map(o => o.brand).join(', ')}`);
+    
+    // STEP 3: If no relevant offers, that's fine! (Not a failure)
+    if (relevantOffers.length === 0) {
+      return {
+        status: 'no_relevant_offers',
+        summary: 'No relevant offers detected (page may be out of scope)',
+        details: `Detected brands: ${detectedContent.brands.join(', ') || 'none'} | Source brands: ${sourceOffers.map(o => o.brand).slice(0, 3).join(', ')}...`,
+        confidence: 90, // High confidence that we correctly determined irrelevance
+        brandMatch: false,
+        offerMatch: false,
+        termsMatch: true, // Not penalizing for irrelevant content
+        foundBrands: detectedContent.brands,
+        foundOffers: detectedContent.offers.slice(0, 2),
+        provider: 'regex',
+        processingTimeMs: Date.now() - startTime,
+        tokensUsed: 0,
+        relevantOffersCount: 0,
+        totalSourceOffers: sourceOffers.length
+      };
+    }
+    
+    // STEP 4: Only verify the relevant offers
+    const verification = this.verifyRelevantOffers(detectedContent, relevantOffers);
     
     const processingTime = Date.now() - startTime;
     
@@ -45,8 +72,216 @@ export class RegexVerifier {
       provider: 'regex',
       processingTimeMs: processingTime,
       tokensUsed: 0,
-      costEstimate: '$0.00'
+      costEstimate: '$0.00',
+      relevantOffersCount: relevantOffers.length,
+      totalSourceOffers: sourceOffers.length,
+      skippedOffers: sourceOffers.length - relevantOffers.length
     };
+  }
+
+  /**
+   * NEW: Find source offers that are actually relevant to this webpage
+   */
+  findRelevantOffers(detectedContent, allSourceOffers) {
+    const relevantOffers = [];
+    
+    for (const sourceOffer of allSourceOffers) {
+      if (this.isOfferRelevantToPage(sourceOffer, detectedContent)) {
+        relevantOffers.push(sourceOffer);
+      }
+    }
+    
+    return relevantOffers;
+  }
+
+  /**
+   * NEW: Determine if a source offer is relevant to the current webpage
+   */
+  isOfferRelevantToPage(sourceOffer, detectedContent) {
+    const { brands, fullText, domain } = detectedContent;
+    
+    // 1. Check if the brand is mentioned on the page
+    if (sourceOffer.brand) {
+      const brandLower = sourceOffer.brand.toLowerCase().replace(/\s+/g, '');
+      
+      // Direct brand name match
+      if (brands.some(brand => 
+        brand.includes(brandLower) || 
+        brandLower.includes(brand)
+      )) {
+        return true;
+      }
+      
+      // Brand mentioned in text
+      if (fullText.includes(sourceOffer.brand.toLowerCase())) {
+        return true;
+      }
+      
+      // Domain-based matching (e.g., betmgm.com should check BetMGM offers)
+      if (domain && domain.includes(brandLower)) {
+        return true;
+      }
+    }
+    
+    // 2. Check if offer keywords are mentioned (for generic offers)
+    if (sourceOffer.offer) {
+      const offerKeywords = sourceOffer.offer.toLowerCase()
+        .split(/\s+/)
+        .filter(word => word.length > 4) // Only meaningful words
+        .filter(word => !['with', 'from', 'when', 'your', 'this', 'that'].includes(word));
+      
+      if (offerKeywords.length > 0) {
+        const matchingKeywords = offerKeywords.filter(keyword => 
+          fullText.includes(keyword)
+        );
+        
+        // If 30%+ of significant keywords match, consider it relevant
+        if (matchingKeywords.length >= Math.max(1, offerKeywords.length * 0.3)) {
+          return true;
+        }
+      }
+    }
+    
+    return false;
+  }
+
+  /**
+   * NEW: Verify only the relevant offers (not all source offers)
+   */
+  verifyRelevantOffers(detectedContent, relevantOffers) {
+    let totalScore = 0;
+    let maxScore = 0;
+    const verificationDetails = [];
+    
+    for (const offer of relevantOffers) {
+      const offerVerification = this.verifyIndividualOffer(offer, detectedContent);
+      totalScore += offerVerification.score;
+      maxScore += offerVerification.maxScore;
+      verificationDetails.push(offerVerification);
+    }
+    
+    const confidence = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+    
+    // Determine overall status based on RELEVANT offers only
+    let status = 'failed';
+    if (confidence >= 75) status = 'verified';
+    else if (confidence >= 50) status = 'partial';
+    
+    return {
+      status,
+      summary: this.generateSmartSummary(verificationDetails, relevantOffers.length),
+      details: this.generateSmartDetails(verificationDetails),
+      confidence,
+      brandMatch: verificationDetails.some(v => v.brandFound),
+      offerMatch: verificationDetails.some(v => v.offerFound),
+      termsMatch: verificationDetails.some(v => v.termsFound),
+      foundBrands: [...new Set(verificationDetails.filter(v => v.brandFound).map(v => v.brand))],
+      foundOffers: verificationDetails.filter(v => v.offerFound).map(v => v.offerText),
+      discrepancies: verificationDetails.filter(v => v.discrepancies.length > 0)
+        .flatMap(v => v.discrepancies)
+    };
+  }
+
+  /**
+   * NEW: Verify a single offer against detected content
+   */
+  verifyIndividualOffer(offer, detectedContent) {
+    const verification = {
+      brand: offer.brand,
+      offerText: offer.offer,
+      brandFound: false,
+      offerFound: false,
+      termsFound: false,
+      score: 0,
+      maxScore: 3,
+      discrepancies: []
+    };
+
+    // Check brand presence
+    if (offer.brand) {
+      const brandLower = offer.brand.toLowerCase();
+      if (detectedContent.brands.some(brand => 
+        brand.includes(brandLower) || brandLower.includes(brand)
+      ) || detectedContent.fullText.includes(brandLower)) {
+        verification.brandFound = true;
+        verification.score += 1;
+      } else {
+        verification.discrepancies.push(`Brand "${offer.brand}" not clearly mentioned`);
+      }
+    } else {
+      verification.score += 1; // No brand to check
+    }
+
+    // Check offer details
+    if (offer.offer) {
+      const offerKeywords = offer.offer.toLowerCase()
+        .split(/\s+/)
+        .filter(word => word.length > 3);
+      
+      const matchingKeywords = offerKeywords.filter(keyword => 
+        detectedContent.fullText.includes(keyword)
+      );
+      
+      if (matchingKeywords.length >= Math.max(1, offerKeywords.length * 0.4)) {
+        verification.offerFound = true;
+        verification.score += 1;
+      } else {
+        verification.discrepancies.push(`Offer details unclear or missing`);
+      }
+    } else {
+      verification.score += 1; // No offer to check
+    }
+
+    // Check terms (if specified)
+    if (offer.keyTandC && offer.keyTandC.trim()) {
+      const termsKeywords = offer.keyTandC.toLowerCase()
+        .split(/\s+/)
+        .filter(word => word.length > 3);
+      
+      if (termsKeywords.some(keyword => detectedContent.fullText.includes(keyword))) {
+        verification.termsFound = true;
+        verification.score += 1;
+      } else {
+        verification.discrepancies.push(`Key terms not mentioned`);
+      }
+    } else {
+      verification.termsFound = true;
+      verification.score += 1; // No terms to check
+    }
+
+    return verification;
+  }
+
+  /**
+   * Generate summary explaining what was actually verified
+   */
+  generateSmartSummary(verificationDetails, totalRelevant) {
+    const successful = verificationDetails.filter(v => v.score >= v.maxScore * 0.7);
+    
+    if (totalRelevant === 0) {
+      return 'No relevant offers to verify';
+    } else if (successful.length === 0) {
+      return `Found ${totalRelevant} relevant offer(s) but accuracy verification failed`;
+    } else if (successful.length === totalRelevant) {
+      return `Successfully verified ${successful.length} relevant offer(s)`;
+    } else {
+      return `Verified ${successful.length}/${totalRelevant} relevant offers`;
+    }
+  }
+
+  /**
+   * Generate detailed breakdown
+   */
+  generateSmartDetails(verificationDetails) {
+    const details = [];
+    
+    verificationDetails.forEach(v => {
+      const score = `${v.score}/${v.maxScore}`;
+      const status = v.score >= v.maxScore * 0.7 ? '✓' : '✗';
+      details.push(`${status} ${v.brand}: ${score}`);
+    });
+    
+    return details.join(' | ');
   }
 
   /**
