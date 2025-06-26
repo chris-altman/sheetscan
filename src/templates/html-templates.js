@@ -94,7 +94,34 @@ export class HtmlTemplates {
     <strong>What this does:</strong> Compares offers in your source sheet against website content to verify accuracy.
     Make sure both sheets are shared with your service account.
   </div>
-  
+  <!-- Add this right after <form> opening tag -->
+<div class="space-y-4">
+    <label class="block text-lg font-semibold text-gray-800 mb-4">
+        Verification Method
+    </label>
+    
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="border-2 rounded-lg p-4">
+            <input type="radio" name="verificationMode" value="regex" checked>
+            <label>Pattern Matching (FREE)</label>
+            <p>Regex-based, 0 tokens</p>
+        </div>
+        
+        <div class="border-2 rounded-lg p-4">
+            <input type="radio" name="verificationMode" value="hybrid">
+            <label>Smart Hybrid (Low Cost)</label>
+            <p>Regex + AI fallback</p>
+        </div>
+        
+        <div class="border-2 rounded-lg p-4">
+            <input type="radio" name="verificationMode" value="llm">
+            <label>Full LLM (High Cost)</label>
+            <p>Complete AI analysis</p>
+        </div>
+    </div>
+</div>
+
+<!-- Then your existing URL fields continue below... -->
   <form method="POST" action="/verify" accept-charset="UTF-8">
     <div class="form-group">
       <label for="sourceSheetUrl">Source Sheet URL (contains offers/brands):</label>
