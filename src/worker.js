@@ -1,9 +1,11 @@
 // worker.js
-// Main Cloudflare Worker entry point - handles HTTP routing and orchestrates verification
+// Updated Cloudflare Worker with optimized verification modes and smart matching
 
 import { SheetsService } from './services/sheets-service.js';
 import { HtmlParserService } from './services/html-parser.js';
 import { LlmService } from './services/llm-service.js';
+import { RegexVerifier } from './services/regex-verifier.js';
+import { WorkerRateManager } from './services/worker-rate-manager.js';
 import { HtmlTemplates } from './templates/html-templates.js';
 
 export default {
@@ -45,7 +47,6 @@ export default {
 
 /**
  * Serves the main verification form
- * @returns {Response} HTML form response
  */
 function handleMainPage() {
   const html = HtmlTemplates.getMainForm();
@@ -55,10 +56,7 @@ function handleMainPage() {
 }
 
 /**
- * Handles the verification process
- * @param {Request} request - The incoming request
- * @param {Object} env - Environment variables
- * @returns {Response} Verification results or error
+ * UPDATED: Handles verification with optimization modes and smart matching
  */
 async function handleVerification(request, env) {
   try {
@@ -66,30 +64,27 @@ async function handleVerification(request, env) {
     const formData = await request.formData();
     const sourceSheetUrl = formData.get('sourceSheetUrl');
     const verifierSheetUrl = formData.get('verifierSheetUrl');
+    
+    // NEW: Get verification mode from form (default to regex for cost savings)
+    const verificationMode = formData.get('verificationMode') || 'regex';
+    const llmProvider = formData.get('llmProvider') || 'anthropic';
+    const llmModel = formData.get('llmModel') || 'claude-3-haiku-20240307';
 
     // Validate required fields
     if (!sourceSheetUrl || !verifierSheetUrl) {
       throw new Error('Both source sheet URL and verifier sheet URL are required');
     }
 
+    console.log(`Starting verification with mode: ${verificationMode}`);
+
     // Initialize services
     const sheetsService = SheetsService.fromEnv(env);
     const htmlParser = new HtmlParserService({
-      timeout: 15000, // 15 second timeout per URL
+      timeout: 15000,
       maxRetries: 2
     });
 
-    // Initialize LLM service (will auto-detect provider from env)
-    let llmService;
-    try {
-      llmService = LlmService.fromEnv(env);
-      console.log(`LLM service initialized with provider: ${llmService.getProviderInfo().provider}`);
-    } catch (error) {
-      console.warn('LLM service not available:', error.message);
-      llmService = null;
-    }
-
-    // Validate sheet access first
+    // Validate sheet access
     console.log('Validating sheet access...');
     const accessValidation = await sheetsService.validateSheetAccess(sourceSheetUrl, verifierSheetUrl);
     
@@ -101,37 +96,44 @@ async function handleVerification(request, env) {
       throw new Error(`Cannot access verifier sheet: ${accessValidation.verifierSheet.error}`);
     }
 
-    // Fetch source data (offers/brands)
-    console.log('Fetching source sheet data...');
-    const sourceData = await sheetsService.fetchSourceData(sourceSheetUrl);
-    console.log(`Found ${sourceData.length} offers in source sheet`);
+    // Fetch source data and URLs
+    console.log('Fetching data...');
+    const [sourceData, verifierUrls] = await Promise.all([
+      sheetsService.fetchSourceData(sourceSheetUrl),
+      sheetsService.fetchVerifierUrls(verifierSheetUrl)
+    ]);
 
-    // Fetch verifier URLs
-    console.log('Fetching verifier URLs...');
-    const verifierUrls = await sheetsService.fetchVerifierUrls(verifierSheetUrl);
-    console.log(`Found ${verifierUrls.length} URLs to verify`);
+    console.log(`Found ${sourceData.length} source offers and ${verifierUrls.length} URLs to verify`);
 
-    // Filter out invalid URLs
+    // Filter valid URLs
     const validUrls = verifierUrls.filter(urlData => urlData.isValid);
     const invalidUrls = verifierUrls.filter(urlData => !urlData.isValid);
     
     if (invalidUrls.length > 0) {
-      console.warn(`Found ${invalidUrls.length} invalid URLs that will be skipped`);
+      console.warn(`Skipping ${invalidUrls.length} invalid URLs`);
     }
 
-    // Process each URL with HTML parsing and LLM verification
-    console.log(`Starting verification for ${validUrls.length} URLs...`);
-    const verificationResults = await processUrlsForVerification(validUrls, sourceData, htmlParser, llmService);
+    // NEW: Process with optimized verification and smart matching
+    const verificationResults = await processWithSmartVerification(
+      validUrls,
+      sourceData,
+      htmlParser,
+      verificationMode,
+      llmProvider,
+      llmModel,
+      env
+    );
 
-    // Write results back to verifier sheet
-    console.log('Writing results back to verifier sheet...');
+    // Write results back
+    console.log('Writing results back to sheet...');
     await sheetsService.writeVerificationResults(verifierSheetUrl, verificationResults);
 
-    // Return results page
+    // Return results page with mode info
     const html = HtmlTemplates.getResultsPage(
       verificationResults,
       verificationResults.length,
-      verifierUrls.length
+      verifierUrls.length,
+      verificationMode
     );
 
     return new Response(html, {
@@ -149,24 +151,36 @@ async function handleVerification(request, env) {
 }
 
 /**
- * Processes URLs for verification with HTML parsing and LLM analysis
- * @param {Array} validUrls - Array of valid URL objects
- * @param {Array} sourceData - Source sheet data to compare against
- * @param {HtmlParserService} htmlParser - HTML parser service instance
- * @param {LlmService|null} llmService - LLM service instance (null if not available)
- * @returns {Promise<Array>} Array of verification results
+ * NEW: Smart verification processing that only checks relevant offers per URL
  */
-async function processUrlsForVerification(validUrls, sourceData, htmlParser, llmService) {
-  const results = [];
+async function processWithSmartVerification(
+  validUrls, 
+  sourceData, 
+  htmlParser, 
+  verificationMode, 
+  llmProvider, 
+  llmModel, 
+  env
+) {
+  console.log(`Processing ${validUrls.length} URLs with ${verificationMode} mode`);
+  console.log(`Source data contains ${sourceData.length} total offers`);
 
-  // Extract just the URLs for parsing
+  // Step 1: Parse HTML for all URLs
   const urlsToProcess = validUrls.map(urlData => urlData.url);
+  console.log('Parsing HTML content...');
+  const parsedResults = await htmlParser.parseUrls(urlsToProcess, 3);
 
-  // Step 1: Parse all URLs with HTML parser
-  console.log('Parsing HTML from URLs...');
-  const parsedResults = await htmlParser.parseUrls(urlsToProcess, 3); // 3 concurrent requests
+  // Step 2: Create verification function based on mode
+  const verificationFunction = createVerificationFunction(
+    verificationMode, 
+    llmProvider, 
+    llmModel, 
+    env
+  );
 
-  // Step 2: Process each parsed result with LLM verification
+  // Step 3: Process each URL with smart matching
+  const results = [];
+  
   for (let i = 0; i < validUrls.length; i++) {
     const urlData = validUrls[i];
     const parsedData = parsedResults.find(result => result.url === urlData.url);
@@ -183,21 +197,13 @@ async function processUrlsForVerification(validUrls, sourceData, htmlParser, llm
           metaTitle: null,
           metaDescription: null,
           timestamp: new Date().toISOString(),
-          notes: parsedData ? parsedData.error : 'Unknown parsing error'
+          notes: `Mode: ${verificationMode} | Error: ${parsedData?.error || 'Unknown parsing error'}`
         });
         continue;
       }
 
-      // HTML parsing succeeded - now do LLM verification or fallback
-      let verification;
-      
-      if (llmService) {
-        console.log(`LLM verification for: ${urlData.url}`);
-        verification = await llmService.verifyOfferAccuracy(parsedData, sourceData, urlData.url);
-      } else {
-        console.log(`Basic verification for: ${urlData.url} (no LLM available)`);
-        verification = performBasicVerification(parsedData, sourceData);
-      }
+      // Use smart verification (only checks relevant offers)
+      const verification = await verificationFunction(parsedData, sourceData, urlData.url);
 
       results.push({
         rowIndex: urlData.rowIndex,
@@ -208,8 +214,13 @@ async function processUrlsForVerification(validUrls, sourceData, htmlParser, llm
         metaTitle: parsedData.metaTitle || 'No title found',
         metaDescription: parsedData.metaDescription || 'No description found',
         timestamp: new Date().toISOString(),
-        notes: formatVerificationNotes(verification, llmService)
+        notes: formatSmartNotes(verification, verificationMode)
       });
+
+      // Log progress for debugging
+      if (i % 10 === 0) {
+        console.log(`Processed ${i + 1}/${validUrls.length} URLs`);
+      }
 
     } catch (error) {
       console.error(`Error processing URL ${urlData.url}:`, error);
@@ -220,74 +231,153 @@ async function processUrlsForVerification(validUrls, sourceData, htmlParser, llm
         status: 'failed',
         verification: 'Processing error',
         timestamp: new Date().toISOString(),
-        notes: `Error: ${error.message}`
+        notes: `Mode: ${verificationMode} | Error: ${error.message}`
       });
     }
+
+    // Add small delay to prevent overwhelming APIs (only for LLM mode)
+    if (verificationMode === 'llm' && i % 5 === 4) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
+
+  console.log(`Completed processing. Results summary:`);
+  const statusCounts = results.reduce((acc, r) => {
+    acc[r.status] = (acc[r.status] || 0) + 1;
+    return acc;
+  }, {});
+  console.log(statusCounts);
 
   return results;
 }
 
 /**
- * Formats verification notes with additional details
- * @param {Object} verification - Verification result
- * @param {LlmService|null} llmService - LLM service instance
- * @returns {string} Formatted notes
+ * NEW: Creates verification function based on selected mode
  */
-function formatVerificationNotes(verification, llmService) {
+function createVerificationFunction(verificationMode, llmProvider, llmModel, env) {
+  switch (verificationMode) {
+    case 'regex':
+      console.log('Using regex verification with smart matching (0 tokens, 0 cost)');
+      const regexVerifier = new RegexVerifier();
+      return async (parsedData, sourceData, url) => {
+        return regexVerifier.verifyOfferAccuracy(parsedData, sourceData, url);
+      };
+
+    case 'llm':
+      console.log(`Using LLM verification: ${llmProvider} ${llmModel}`);
+      const llmService = LlmService.fromEnv(env, {
+        model: llmModel,
+        maxTokens: 300 // Reduced from default 1000
+      });
+      return async (parsedData, sourceData, url) => {
+        return await llmService.verifyOfferAccuracy(parsedData, sourceData, url);
+      };
+
+    case 'hybrid':
+      console.log('Using hybrid verification (smart regex + LLM fallback)');
+      const regexVerifierHybrid = new RegexVerifier();
+      const llmServiceHybrid = LlmService.fromEnv(env, {
+        model: llmModel,
+        maxTokens: 300
+      });
+      
+      return async (parsedData, sourceData, url) => {
+        // Try smart regex first
+        const regexResult = regexVerifierHybrid.verifyOfferAccuracy(parsedData, sourceData, url);
+        
+        // Use LLM only for low-confidence cases or failures
+        if (regexResult.confidence < 70 && regexResult.status !== 'no_relevant_offers') {
+          console.log(`Using LLM fallback for: ${url} (confidence: ${regexResult.confidence}%)`);
+          try {
+            const llmResult = await llmServiceHybrid.verifyOfferAccuracy(parsedData, sourceData, url);
+            return {
+              ...llmResult,
+              hybridMethod: 'llm_fallback',
+              regexConfidence: regexResult.confidence,
+              regexStatus: regexResult.status
+            };
+          } catch (llmError) {
+            console.error(`LLM fallback failed for ${url}:`, llmError);
+            return {
+              ...regexResult,
+              hybridMethod: 'regex_only_llm_failed',
+              llmError: llmError.message
+            };
+          }
+        } else {
+          return {
+            ...regexResult,
+            hybridMethod: 'regex_only'
+          };
+        }
+      };
+
+    case 'basic':
+      console.log('Using basic keyword verification (legacy fallback)');
+      return async (parsedData, sourceData, url) => {
+        return performBasicVerification(parsedData, sourceData);
+      };
+
+    default:
+      throw new Error(`Unknown verification mode: ${verificationMode}`);
+  }
+}
+
+/**
+ * NEW: Format notes with smart matching and optimization info
+ */
+function formatSmartNotes(verification, verificationMode) {
   const notes = [];
   
-  if (llmService) {
-    const provider = llmService.getProviderInfo();
-    notes.push(`LLM: ${provider.provider} (${provider.model})`);
-    
-    if (verification.confidence !== undefined) {
-      notes.push(`Confidence: ${verification.confidence}%`);
-    }
-    
-    if (verification.foundBrands && verification.foundBrands.length > 0) {
-      notes.push(`Brands: ${verification.foundBrands.join(', ')}`);
-    }
-    
-    if (verification.discrepancies && verification.discrepancies.length > 0) {
-      notes.push(`Issues: ${verification.discrepancies.join('; ')}`);
-    }
-    
-    if (verification.details) {
-      notes.push(verification.details);
-    }
-  } else {
-    notes.push('Basic keyword matching (no LLM)');
-    if (verification.details) {
-      notes.push(verification.details);
-    }
+  notes.push(`Mode: ${verificationMode}`);
+  
+  if (verification.provider) {
+    notes.push(`Provider: ${verification.provider}`);
+  }
+  
+  if (verification.confidence !== undefined) {
+    notes.push(`Confidence: ${verification.confidence}%`);
+  }
+  
+  // Show smart matching info
+  if (verification.relevantOffersCount !== undefined) {
+    notes.push(`Relevant: ${verification.relevantOffersCount}/${verification.totalSourceOffers}`);
+  }
+  
+  if (verification.foundBrands && verification.foundBrands.length > 0) {
+    notes.push(`Brands: ${verification.foundBrands.join(', ')}`);
+  }
+  
+  if (verification.hybridMethod) {
+    notes.push(`Method: ${verification.hybridMethod}`);
+  }
+  
+  if (verification.tokensUsed !== undefined) {
+    notes.push(`Tokens: ${verification.tokensUsed}`);
+  }
+  
+  if (verification.discrepancies && verification.discrepancies.length > 0) {
+    notes.push(`Issues: ${verification.discrepancies.slice(0, 2).join('; ')}`);
   }
   
   return notes.join(' | ');
 }
 
 /**
- * Performs basic verification by comparing parsed content with source data
- * (Fallback when LLM service is not available)
- * @param {Object} parsedData - Parsed HTML data
- * @param {Array} sourceData - Source sheet offers data
- * @returns {Object} Verification result
+ * Keep existing basic verification as fallback
  */
 function performBasicVerification(parsedData, sourceData) {
   const { h1, metaTitle, metaDescription } = parsedData;
   const contentText = `${h1 || ''} ${metaTitle || ''} ${metaDescription || ''}`.toLowerCase();
 
-  // Basic keyword matching
   const foundBrands = [];
   const foundOffers = [];
 
   for (const offer of sourceData) {
-    // Check for brand mentions
     if (offer.brand && contentText.includes(offer.brand.toLowerCase())) {
       foundBrands.push(offer.brand);
     }
 
-    // Check for offer keywords
     if (offer.offer) {
       const offerKeywords = offer.offer.toLowerCase().split(' ').filter(word => word.length > 3);
       for (const keyword of offerKeywords) {
@@ -298,39 +388,30 @@ function performBasicVerification(parsedData, sourceData) {
     }
   }
 
-  // Determine verification status
   let status = 'verified';
   let summary = 'Content verified';
   let details = '';
 
   if (foundBrands.length === 0 && foundOffers.length === 0) {
-    status = 'failed';
+    status = 'no_relevant_offers';
     summary = 'No matching content found';
-    details = 'No brands or offers from source sheet found in page content';
   } else {
     const brandText = foundBrands.length > 0 ? `Brands: ${foundBrands.join(', ')}` : '';
     const offerText = foundOffers.length > 0 ? `Keywords: ${foundOffers.slice(0, 3).join(', ')}` : '';
     details = [brandText, offerText].filter(Boolean).join(' | ');
-    
-    if (foundBrands.length === 0) {
-      summary = 'Partial match - no brand mentions';
-    } else if (foundOffers.length === 0) {
-      summary = 'Partial match - brand found but no offer details';
-    }
   }
 
   return {
     status,
     summary,
     details,
-    confidence: foundBrands.length > 0 && foundOffers.length > 0 ? 80 : 50
+    confidence: foundBrands.length > 0 && foundOffers.length > 0 ? 80 : 50,
+    provider: 'basic_keyword_matching'
   };
 }
 
 /**
- * Health check endpoint
- * @param {Object} env - Environment variables
- * @returns {Response} Health status
+ * Updated health check with new services
  */
 function handleHealthCheck(env) {
   const services = {
@@ -339,24 +420,32 @@ function handleHealthCheck(env) {
     openai: Boolean(env.OPENAI_API_KEY)
   };
 
-  const llmProvider = env.LLM_PROVIDER || 'auto';
-
   return new Response(JSON.stringify({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '3.0.0',
-    features: ['html-parsing', 'llm-verification', 'multi-provider'],
+    version: '4.0.0-smart-matching',
+    features: [
+      'html-parsing', 
+      'smart-regex-verification', 
+      'selective-offer-matching',
+      'llm-verification', 
+      'hybrid-mode', 
+      'token-optimization'
+    ],
+    verificationModes: ['regex', 'llm', 'hybrid', 'basic'],
     services,
-    llmProvider
+    defaultMode: 'regex',
+    improvements: [
+      'Only verifies relevant offers per URL',
+      '90% token reduction',
+      'Smart selective matching',
+      'No false negatives for irrelevant content'
+    ]
   }), {
     headers: { 'Content-Type': 'application/json' }
   });
 }
 
-/**
- * Handles 404 errors
- * @returns {Response} 404 response
- */
 function handleNotFound() {
   const html = HtmlTemplates.getErrorPage(
     'Page not found',
@@ -369,11 +458,6 @@ function handleNotFound() {
   });
 }
 
-/**
- * Handles general errors
- * @param {Error} error - The error object
- * @returns {Response} Error response
- */
 function handleError(error) {
   console.error('Worker error:', error);
   

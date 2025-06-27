@@ -27,12 +27,12 @@ export class SheetsService {
    * @param {string} [range='A3:E'] - Range to fetch (default skips headers)
    * @returns {Promise<Array>} Array of offer objects
    */
-  async fetchSourceData(sourceSheetUrl, sheetName = 'Offers + Codes - US', range = 'A3:E') {
+  async fetchSourceData(sourceSheetUrl, sheetName = 'Offers %2B Codes - US', range = 'A3:E') {
     const { sheetId } = UrlHelpers.parseSheetUrl(sourceSheetUrl);
     const accessToken = await this.authService.getAccessToken();
     const fullRange = `'${sheetName}'!${range}`;
 
-    const url = `${this.baseUrl}/${sheetId}/values/${encodeURIComponent(fullRange)}`;
+    const url = `${this.baseUrl}/${sheetId}/values/${fullRange}`;
 
     const response = await fetch(url, {
       method: 'GET',
@@ -79,7 +79,7 @@ export class SheetsService {
     const accessToken = await this.authService.getAccessToken();
     const fullRange = `'${sheetName}'!${range}`;
 
-    const url = `${this.baseUrl}/${sheetId}/values/${encodeURIComponent(fullRange)}`;
+    const url = `${this.baseUrl}/${sheetId}/values/${fullRange}`;
 
     const response = await fetch(url, {
       method: 'GET',
