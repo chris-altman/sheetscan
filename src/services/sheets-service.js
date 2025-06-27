@@ -71,10 +71,10 @@ export class SheetsService {
    * Fetches URLs from verifier sheet (Column A)
    * @param {string} verifierSheetUrl - Google Sheets URL for verifier data
    * @param {string} [sheetName='Sheet1'] - Name of the sheet tab
-   * @param {string} [range='A:A'] - Range to fetch (default is all of column A)
+   * @param {string} [range='A2:CE412'] - Range to fetch (default is all of column A)
    * @returns {Promise<Array>} Array of URL objects with row indices
    */
-  async fetchVerifierUrls(verifierSheetUrl, sheetName = 'Sheet1', range = 'A:A') {
+  async fetchVerifierUrls(verifierSheetUrl, sheetName = 'Sheet1', range = 'A2:CE412') {
     const { sheetId } = UrlHelpers.parseSheetUrl(verifierSheetUrl);
     const accessToken = await this.authService.getAccessToken();
     const fullRange = `'${sheetName}'!${range}`;
