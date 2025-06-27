@@ -11,6 +11,18 @@ export class RegexVerifier {
   }
 
   /**
+   * Extract domain from URL
+   */
+  extractDomain(url) {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.hostname;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
    * FIXED: Main verification method with smart selective matching
    * @param {Object} htmlData - Parsed HTML data
    * @param {Array} sourceOffers - Source sheet offers  
