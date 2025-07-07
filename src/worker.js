@@ -31,6 +31,7 @@ export default {
           return handleMainPage();
 
         case request.method === 'POST' && url.pathname === '/verify':
+        case request.method === 'GET' && url.pathname === '/verify':
           return await handleVerification(request, env);
 
         case request.method === 'GET' && url.pathname === '/health':
