@@ -252,7 +252,11 @@ export class RegexVerifier {
       
       if (termsKeywords.some(keyword => detectedContent.fullText.includes(keyword))) {
         verification.termsFound = true;
-        verification.score += 1;
+        verification.score += 1; // for terms
+        // BUT if brand + offer both found, give bonus points
+        if (verification.brandFound && verification.offerFound) {
+          verification.score += 0.5; // Bonus for strong match
+        }
       } else {
         verification.discrepancies.push(`Key terms not mentioned`);
       }
@@ -538,7 +542,7 @@ export class RegexVerifier {
     if (fullText.length > 100) confidence += 5;
     if (detected.detectedAmounts.length > 0) confidence += 5;
 
-    if (confidence >= 80) status = 'verified';
+    if (confidence >= 75) status = 'verified';
     else if (confidence >= 50) status = 'partial';
 
     return {

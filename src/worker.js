@@ -29,13 +29,13 @@ export default {
       switch (true) {
         case request.method === 'GET' && url.pathname === '/':
           return handleMainPage();
-          
+
         case request.method === 'POST' && url.pathname === '/verify':
           return await handleVerification(request, env);
-          
+
         case request.method === 'GET' && url.pathname === '/health':
           return handleHealthCheck(env);
-          
+
         default:
           return handleNotFound();
       }
@@ -64,7 +64,7 @@ async function handleVerification(request, env) {
     const formData = await request.formData();
     const sourceSheetUrl = formData.get('sourceSheetUrl');
     const verifierSheetUrl = formData.get('verifierSheetUrl');
-    
+
     // NEW: Get verification mode from form (default to regex for cost savings)
     const verificationMode = formData.get('verificationMode') || 'regex';
     const llmProvider = formData.get('llmProvider') || 'anthropic';
@@ -87,11 +87,11 @@ async function handleVerification(request, env) {
     // Validate sheet access
     console.log('Validating sheet access...');
     const accessValidation = await sheetsService.validateSheetAccess(sourceSheetUrl, verifierSheetUrl);
-    
+
     if (!accessValidation.sourceSheet.accessible) {
       throw new Error(`Cannot access source sheet: ${accessValidation.sourceSheet.error}`);
     }
-    
+
     if (!accessValidation.verifierSheet.accessible) {
       throw new Error(`Cannot access verifier sheet: ${accessValidation.verifierSheet.error}`);
     }
@@ -108,22 +108,51 @@ async function handleVerification(request, env) {
     // Filter valid URLs
     const validUrls = verifierUrls.filter(urlData => urlData.isValid);
     const invalidUrls = verifierUrls.filter(urlData => !urlData.isValid);
-    
+
     if (invalidUrls.length > 0) {
       console.warn(`Skipping ${invalidUrls.length} invalid URLs`);
     }
 
     // NEW: Process with optimized verification and smart matching
-    const verificationResults = await processWithSmartVerification(
-      validUrls,
-      sourceData,
-      htmlParser,
-      verificationMode,
-      llmProvider,
-      llmModel,
-      env
-    );
+    // Filter valid URLs
+    validUrls = verifierUrls.filter(urlData => urlData.isValid);
 
+    // CHUNKING LOGIC
+    const chunkSize = verificationMode === 'regex' ? 25 : verificationMode === 'hybrid' ? 15 : 8;
+
+    if (validUrls.length > chunkSize) {
+      // Use batching for large datasets
+      const rateManager = new WorkerRateManager({ chunkSize, maxExecutionTime: 45000 });
+
+      return rateManager.handleContinuationRequest(request, async ({ continueFrom, jobId }) => {
+        const chunk = validUrls.slice(continueFrom, continueFrom + chunkSize);
+
+        const verificationResults = await processWithSmartVerification(
+          chunk, sourceData, htmlParser, verificationMode, llmProvider, llmModel, env
+        );
+
+        // Write chunk results back
+        await sheetsService.writeVerificationResults(verifierSheetUrl, verificationResults);
+
+        return {
+          results: verificationResults,
+          processed: continueFrom + chunk.length,
+          total: validUrls.length,
+          completed: continueFrom + chunk.length >= validUrls.length,
+          needsContinuation: continueFrom + chunk.length < validUrls.length
+        };
+      });
+    } else {
+      // Process normally for small datasets
+      const verificationResults = await processWithSmartVerification(
+        validUrls, sourceData, htmlParser, verificationMode, llmProvider, llmModel, env
+      );
+
+      await sheetsService.writeVerificationResults(verifierSheetUrl, verificationResults);
+
+      const html = HtmlTemplates.getResultsPage(verificationResults, validUrls.length, verifierUrls.length, verificationMode);
+      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
     // Write results back
     console.log('Writing results back to sheet...');
     await sheetsService.writeVerificationResults(verifierSheetUrl, verificationResults);
@@ -154,12 +183,12 @@ async function handleVerification(request, env) {
  * NEW: Smart verification processing that only checks relevant offers per URL
  */
 async function processWithSmartVerification(
-  validUrls, 
-  sourceData, 
-  htmlParser, 
-  verificationMode, 
-  llmProvider, 
-  llmModel, 
+  validUrls,
+  sourceData,
+  htmlParser,
+  verificationMode,
+  llmProvider,
+  llmModel,
   env
 ) {
   console.log(`Processing ${validUrls.length} URLs with ${verificationMode} mode`);
@@ -172,15 +201,15 @@ async function processWithSmartVerification(
 
   // Step 2: Create verification function based on mode
   const verificationFunction = createVerificationFunction(
-    verificationMode, 
-    llmProvider, 
-    llmModel, 
+    verificationMode,
+    llmProvider,
+    llmModel,
     env
   );
 
   // Step 3: Process each URL with smart matching
   const results = [];
-  
+
   for (let i = 0; i < validUrls.length; i++) {
     const urlData = validUrls[i];
     const parsedData = parsedResults.find(result => result.url === urlData.url);
@@ -224,7 +253,7 @@ async function processWithSmartVerification(
 
     } catch (error) {
       console.error(`Error processing URL ${urlData.url}:`, error);
-      
+
       results.push({
         rowIndex: urlData.rowIndex,
         url: urlData.url,
@@ -280,11 +309,11 @@ function createVerificationFunction(verificationMode, llmProvider, llmModel, env
         model: llmModel,
         maxTokens: 300
       });
-      
+
       return async (parsedData, sourceData, url) => {
         // Try smart regex first
         const regexResult = regexVerifierHybrid.verifyOfferAccuracy(parsedData, sourceData, url);
-        
+
         // Use LLM only for low-confidence cases or failures
         if (regexResult.confidence < 70 && regexResult.status !== 'no_relevant_offers') {
           console.log(`Using LLM fallback for: ${url} (confidence: ${regexResult.confidence}%)`);
@@ -328,39 +357,26 @@ function createVerificationFunction(verificationMode, llmProvider, llmModel, env
  */
 function formatSmartNotes(verification, verificationMode) {
   const notes = [];
-  
-  notes.push(`Mode: ${verificationMode}`);
-  
-  if (verification.provider) {
-    notes.push(`Provider: ${verification.provider}`);
-  }
-  
-  if (verification.confidence !== undefined) {
-    notes.push(`Confidence: ${verification.confidence}%`);
-  }
-  
-  // Show smart matching info
+
+  // Primary info
+  notes.push(`${verificationMode.toUpperCase()} (${verification.confidence || 0}% confidence)`);
+
+  // Smart matching summary
   if (verification.relevantOffersCount !== undefined) {
-    notes.push(`Relevant: ${verification.relevantOffersCount}/${verification.totalSourceOffers}`);
+    notes.push(`Found: ${verification.relevantOffersCount} relevant offers`);
   }
-  
-  if (verification.foundBrands && verification.foundBrands.length > 0) {
-    notes.push(`Brands: ${verification.foundBrands.join(', ')}`);
-  }
-  
-  if (verification.hybridMethod) {
-    notes.push(`Method: ${verification.hybridMethod}`);
-  }
-  
-  if (verification.tokensUsed !== undefined) {
-    notes.push(`Tokens: ${verification.tokensUsed}`);
-  }
-  
+
+  // Key issues only (limit to 2)
   if (verification.discrepancies && verification.discrepancies.length > 0) {
     notes.push(`Issues: ${verification.discrepancies.slice(0, 2).join('; ')}`);
   }
-  
-  return notes.join(' | ');
+
+  // Tokens if LLM
+  if (verification.tokensUsed !== undefined && verification.tokensUsed > 0) {
+    notes.push(`Tokens: ${verification.tokensUsed}`);
+  }
+
+  return notes.join('\n'); // LINE BREAKS INSTEAD OF PIPES
 }
 
 /**
@@ -425,11 +441,11 @@ function handleHealthCheck(env) {
     timestamp: new Date().toISOString(),
     version: '4.0.0-smart-matching',
     features: [
-      'html-parsing', 
-      'smart-regex-verification', 
+      'html-parsing',
+      'smart-regex-verification',
       'selective-offer-matching',
-      'llm-verification', 
-      'hybrid-mode', 
+      'llm-verification',
+      'hybrid-mode',
       'token-optimization'
     ],
     verificationModes: ['regex', 'llm', 'hybrid', 'basic'],
@@ -451,7 +467,7 @@ function handleNotFound() {
     'Page not found',
     'The requested page does not exist.'
   );
-  
+
   return new Response(html, {
     status: 404,
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -460,12 +476,12 @@ function handleNotFound() {
 
 function handleError(error) {
   console.error('Worker error:', error);
-  
+
   const html = HtmlTemplates.getErrorPage(
     'Internal server error',
     error.message
   );
-  
+
   return new Response(html, {
     status: 500,
     headers: { 'Content-Type': 'text/html; charset=utf-8' }

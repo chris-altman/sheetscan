@@ -19,14 +19,14 @@ export class WorkerRateManager {
   async processInChunks(urls, processorFunction, options = {}) {
     const startTime = Date.now();
     const { continueFrom = 0, saveProgressCallback } = options;
-    
+
     const results = [];
     let processedCount = continueFrom;
     let shouldContinue = true;
-    
+
     // Resume from where we left off
     const remainingUrls = urls.slice(continueFrom);
-    
+
     for (let i = 0; i < remainingUrls.length && shouldContinue; i += this.chunkSize) {
       // Check if we're approaching timeout
       const elapsed = Date.now() - startTime;
@@ -35,20 +35,20 @@ export class WorkerRateManager {
         shouldContinue = false;
         break;
       }
-      
+
       const chunk = remainingUrls.slice(i, i + this.chunkSize);
       console.log(`Processing chunk ${Math.floor(i / this.chunkSize) + 1}, URLs ${processedCount + i + 1}-${processedCount + i + chunk.length}`);
-      
+
       try {
         // Process chunk with timeout protection
         const chunkResults = await Promise.race([
           processorFunction(chunk),
           this.timeoutPromise(10000) // 10s timeout per chunk
         ]);
-        
+
         results.push(...chunkResults);
         processedCount += chunk.length;
-        
+
         // Save progress periodically
         if (saveProgressCallback && (processedCount % 50 === 0)) {
           await saveProgressCallback({
@@ -57,15 +57,15 @@ export class WorkerRateManager {
             results: results.slice(-chunk.length) // Only save recent results
           });
         }
-        
+
         // Pause between chunks to avoid rate limits
         if (i + this.chunkSize < remainingUrls.length) {
           await this.delay(this.pauseBetweenChunks);
         }
-        
+
       } catch (error) {
         console.error(`Chunk processing error at ${processedCount + i}:`, error);
-        
+
         // Add failed results for this chunk
         chunk.forEach((item, index) => {
           results.push({
@@ -79,14 +79,14 @@ export class WorkerRateManager {
             termsMatch: false
           });
         });
-        
+
         processedCount += chunk.length;
       }
     }
-    
+
     const completed = processedCount >= urls.length;
     const nextContinueFrom = completed ? 0 : processedCount;
-    
+
     return {
       results,
       completed,
@@ -108,28 +108,31 @@ export class WorkerRateManager {
     const url = new URL(request.url);
     const continueFrom = parseInt(url.searchParams.get('continue_from') || '0');
     const jobId = url.searchParams.get('job_id') || this.generateJobId();
-    
+
     try {
       const result = await processingFunction({ continueFrom, jobId });
-      
+
       if (result.needsContinuation) {
-        // Return continuation response
-        return new Response(JSON.stringify({
-          success: true,
-          partial: true,
-          jobId,
+        // HTML auto-progression response
+        const continuationUrl = `${url.origin}${url.pathname}?job_id=${jobId}&continue_from=${result.continueFrom}`;
+        const delaySeconds = 3;
+
+        const html = HtmlTemplates.getBatchProgressPage({
           processed: result.processed,
           total: result.total,
-          continueFrom: result.continueFrom,
-          continuationUrl: `${url.origin}${url.pathname}?job_id=${jobId}&continue_from=${result.continueFrom}`,
-          results: result.results,
-          message: `Processed ${result.processed}/${result.total} URLs. Continue processing with the provided URL.`
-        }), {
-          status: 202, // Accepted - processing continues
-          headers: { 'Content-Type': 'application/json' }
+          currentBatch: Math.ceil(result.processed / 20),
+          totalBatches: Math.ceil(result.total / 20),
+          continuationUrl,
+          delaySeconds,
+          results: result.results
+        });
+
+        return new Response(html, {
+          status: 200,
+          headers: { 'Content-Type': 'text/html; charset=utf-8' }
         });
       } else {
-        // Return completed response
+        // Keep the existing completion response
         return new Response(JSON.stringify({
           success: true,
           completed: true,
@@ -144,7 +147,7 @@ export class WorkerRateManager {
           headers: { 'Content-Type': 'application/json' }
         });
       }
-      
+
     } catch (error) {
       return new Response(JSON.stringify({
         success: false,
@@ -167,7 +170,7 @@ export class WorkerRateManager {
   async rateLimitedFetch(urls, fetchFunction) {
     const results = [];
     const semaphore = new Semaphore(this.maxConcurrentRequests);
-    
+
     const promises = urls.map(async (url) => {
       await semaphore.acquire();
       try {
@@ -186,7 +189,7 @@ export class WorkerRateManager {
         semaphore.release();
       }
     });
-    
+
     await Promise.all(promises);
     return results;
   }
@@ -200,11 +203,11 @@ export class WorkerRateManager {
    */
   async smartBatch(htmlDataArray, config, verificationFunction) {
     const { verificationMode, batchSize = 5, delayMs = 500 } = config;
-    
+
     // Adjust batching strategy based on mode
     let effectiveBatchSize = batchSize;
     let effectiveDelay = delayMs;
-    
+
     if (verificationMode === 'regex') {
       // Regex can handle larger batches
       effectiveBatchSize = Math.min(50, htmlDataArray.length);
@@ -214,20 +217,20 @@ export class WorkerRateManager {
       effectiveBatchSize = Math.min(15, batchSize);
       effectiveDelay = delayMs / 2;
     }
-    
+
     const results = [];
-    
+
     for (let i = 0; i < htmlDataArray.length; i += effectiveBatchSize) {
       const batch = htmlDataArray.slice(i, i + effectiveBatchSize);
-      
+
       try {
         const batchResults = await verificationFunction(batch);
         results.push(...batchResults);
-        
+
         if (effectiveDelay > 0 && i + effectiveBatchSize < htmlDataArray.length) {
           await this.delay(effectiveDelay);
         }
-        
+
       } catch (error) {
         console.error(`Smart batch error at index ${i}:`, error);
         // Add failed results for this batch
@@ -245,7 +248,7 @@ export class WorkerRateManager {
         });
       }
     }
-    
+
     return results;
   }
 
@@ -295,7 +298,7 @@ export class WorkerRateManager {
   }
 
   timeoutPromise(ms) {
-    return new Promise((_, reject) => 
+    return new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Operation timeout')), ms)
     );
   }
