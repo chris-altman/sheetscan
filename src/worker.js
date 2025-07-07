@@ -112,11 +112,6 @@ async function handleVerification(request, env) {
     if (invalidUrls.length > 0) {
       console.warn(`Skipping ${invalidUrls.length} invalid URLs`);
     }
-
-    // NEW: Process with optimized verification and smart matching
-    // Filter valid URLs
-    validUrls = verifierUrls.filter(urlData => urlData.isValid);
-
     // CHUNKING LOGIC
     const chunkSize = verificationMode === 'regex' ? 25 : verificationMode === 'hybrid' ? 15 : 8;
 

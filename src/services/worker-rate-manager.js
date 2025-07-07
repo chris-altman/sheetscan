@@ -1,5 +1,6 @@
 // worker-rate-manager.js
 // Handle Cloudflare Worker timeouts and rate limits
+import { HtmlTemplates } from '../templates/html-templates.js';
 
 export class WorkerRateManager {
   constructor(options = {}) {
