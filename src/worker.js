@@ -62,7 +62,16 @@ function handleMainPage() {
 async function handleVerification(request, env) {
   try {
     // Parse form data
-    const formData = await request.formData();
+    let formData;
+    if (request.method === 'POST') {
+      formData = await request.formData();
+    } else {
+      // GET request - get params from URL
+      const url = new URL(request.url);
+      formData = {
+        get: (key) => url.searchParams.get(key)
+      };
+    }
     const sourceSheetUrl = formData.get('sourceSheetUrl');
     const verifierSheetUrl = formData.get('verifierSheetUrl');
 
